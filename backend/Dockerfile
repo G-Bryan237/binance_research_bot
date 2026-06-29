@@ -17,4 +17,4 @@ COPY run_*.py ./
 RUN mkdir -p data out reports/conservative reports/aggressive
 
 # Default command runs multi-profile mode
-CMD ["python", "run_multiprofile.py"]
+CMD ["python", "run_api.py"]
