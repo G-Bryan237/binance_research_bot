@@ -35,20 +35,30 @@ export default function HomePage() {
   const [allTrades, setAllTrades] = useState<Trade[]>([]);
 
   const getApiBase = (profile: "conservative" | "aggressive") => {
-    const port = profile === "conservative" ? 5001 : 5002;
-    return `http://127.0.0.1:${port}`;
+    const envUrl =
+      profile === "conservative"
+        ? process.env.NEXT_PUBLIC_CONSERVATIVE_API_URL
+        : process.env.NEXT_PUBLIC_AGGRESSIVE_API_URL;
+    return (envUrl || "").replace(/\/+$/, "");
   };
 
   const getWsUrl = (profile: "conservative" | "aggressive") => {
-    const port = profile === "conservative" ? 5001 : 5002;
-    return `http://127.0.0.1:${port}`;
+    // Socket.IO accepts https base URLs and upgrades transport as needed.
+    const apiBase = getApiBase(profile);
+    return apiBase;
   };
 
   const fetchProfiles = useCallback(async () => {
     try {
+      const conservativeApi = getApiBase("conservative");
+      const aggressiveApi = getApiBase("aggressive");
+      if (!conservativeApi || !aggressiveApi) {
+        throw new Error("Missing NEXT_PUBLIC_CONSERVATIVE_API_URL or NEXT_PUBLIC_AGGRESSIVE_API_URL");
+      }
+
       const [conservativeRes, aggressiveRes] = await Promise.all([
-        fetch(`${getApiBase("conservative")}/api/state`).catch(() => null),
-        fetch(`${getApiBase("aggressive")}/api/state`).catch(() => null),
+        fetch(`${conservativeApi}/api/state`).catch(() => null),
+        fetch(`${aggressiveApi}/api/state`).catch(() => null),
       ]);
 
       const newProfiles: Record<"conservative" | "aggressive", ProfileInfo | null> = {
@@ -82,11 +92,17 @@ export default function HomePage() {
 
   const fetchAllTrades = useCallback(async () => {
     try {
+      const conservativeApi = getApiBase("conservative");
+      const aggressiveApi = getApiBase("aggressive");
+      if (!conservativeApi || !aggressiveApi) {
+        throw new Error("Missing NEXT_PUBLIC_CONSERVATIVE_API_URL or NEXT_PUBLIC_AGGRESSIVE_API_URL");
+      }
+
       const [conservativeTrades, aggressiveTrades] = await Promise.all([
-        fetch(`${getApiBase("conservative")}/api/trades`)
+        fetch(`${conservativeApi}/api/trades`)
           .then((res) => (res.ok ? res.json() : { trades: [] }))
           .catch(() => ({ trades: [] })),
-        fetch(`${getApiBase("aggressive")}/api/trades`)
+        fetch(`${aggressiveApi}/api/trades`)
           .then((res) => (res.ok ? res.json() : { trades: [] }))
           .catch(() => ({ trades: [] })),
       ]);
