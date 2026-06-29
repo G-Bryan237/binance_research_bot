@@ -50,6 +50,7 @@ class PeriodReport:
     avg_r_multiple: float
     max_drawdown_pct: float
     strategy_breakdown: List[StrategyStats]
+    signal_stats: Dict[str, Any]
     generated_at: str
 
 
@@ -93,6 +94,97 @@ class ReportGenerator:
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
 
+    def _get_signals_for_period(
+        self, start_time: datetime, end_time: datetime
+    ) -> List[Dict[str, Any]]:
+        """Fetch signal journal rows within the specified time period."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    SELECT
+                        generated_at_utc, symbol, market, direction, entry, stop,
+                        target_1, target_2, risk_multiple, strategy_module, regime,
+                        quality_score, quality_label, status, status_reason, pnl,
+                        r_multiple, close_reason
+                    FROM signal_journal
+                    WHERE generated_at_utc >= ? AND generated_at_utc < ?
+                    ORDER BY generated_at_utc ASC
+                    """,
+                    (start_time.isoformat(), end_time.isoformat()),
+                )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.OperationalError:
+            return []
+
+    def _calculate_signal_stats(self, signals: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Calculate signal forecast quality and lifecycle stats."""
+        opened_statuses = {"OPENED", "PENDING_ORDER", "SUCCEEDED", "FAILED"}
+        blocked_statuses = {
+            "BLOCKED_BY_RISK",
+            "BLOCKED_BY_EXECUTION",
+            "BLOCKED_BY_MTF",
+            "BLOCKED_BY_FUNDING",
+            "BLOCKED_BY_MODULE_SCORECARD",
+            "NOT_SELECTED",
+            "DUPLICATE",
+            "EXPIRED",
+        }
+        total = len(signals)
+        opened = [s for s in signals if s.get("status") in opened_statuses]
+        blocked = [s for s in signals if s.get("status") in blocked_statuses or str(s.get("status") or "").startswith("BLOCKED")]
+        succeeded = [s for s in signals if s.get("status") == "SUCCEEDED"]
+        failed = [s for s in signals if s.get("status") == "FAILED"]
+        resolved = len(succeeded) + len(failed)
+
+        by_module: Dict[str, Dict[str, Any]] = {}
+        for signal in signals:
+            module = str(signal.get("strategy_module") or "UNKNOWN")
+            mod = by_module.setdefault(
+                module,
+                {
+                    "total_signals": 0,
+                    "opened_signals": 0,
+                    "blocked_signals": 0,
+                    "succeeded_signals": 0,
+                    "failed_signals": 0,
+                    "success_rate": 0.0,
+                    "open_rate": 0.0,
+                    "avg_quality_score": 0.0,
+                },
+            )
+            status = str(signal.get("status") or "GENERATED")
+            mod["total_signals"] += 1
+            if status in opened_statuses:
+                mod["opened_signals"] += 1
+            if status in blocked_statuses or status.startswith("BLOCKED"):
+                mod["blocked_signals"] += 1
+            if status == "SUCCEEDED":
+                mod["succeeded_signals"] += 1
+            if status == "FAILED":
+                mod["failed_signals"] += 1
+            mod["avg_quality_score"] += float(signal.get("quality_score") or 0.0)
+
+        for mod in by_module.values():
+            mod_resolved = mod["succeeded_signals"] + mod["failed_signals"]
+            mod["success_rate"] = (mod["succeeded_signals"] / mod_resolved) if mod_resolved else 0.0
+            mod["open_rate"] = (mod["opened_signals"] / mod["total_signals"]) if mod["total_signals"] else 0.0
+            mod["avg_quality_score"] = mod["avg_quality_score"] / mod["total_signals"] if mod["total_signals"] else 0.0
+
+        avg_quality = sum(float(s.get("quality_score") or 0.0) for s in signals) / total if total else 0.0
+        return {
+            "total_signals": total,
+            "opened_signals": len(opened),
+            "blocked_signals": len(blocked),
+            "succeeded_signals": len(succeeded),
+            "failed_signals": len(failed),
+            "success_rate": (len(succeeded) / resolved) if resolved else 0.0,
+            "open_rate": (len(opened) / total) if total else 0.0,
+            "avg_quality_score": avg_quality,
+            "by_module": dict(sorted(by_module.items())),
+            "recent_signals": signals[-20:],
+        }
     def _get_equity_history_for_period(
         self, start_time: datetime, end_time: datetime
     ) -> List[Dict[str, Any]]:
@@ -193,6 +285,7 @@ class ReportGenerator:
         end_time = start_time + timedelta(days=1)
 
         trades = self._get_trades_for_period(start_time, end_time)
+        signals = self._get_signals_for_period(start_time, end_time)
         equity_history = self._get_equity_history_for_period(start_time, end_time)
 
         # Calculate metrics
@@ -228,6 +321,7 @@ class ReportGenerator:
             avg_r_multiple=sum(r_multiples) / total_trades if total_trades > 0 else 0,
             max_drawdown_pct=self._calculate_max_drawdown(equity_history),
             strategy_breakdown=self._calculate_strategy_stats(trades),
+            signal_stats=self._calculate_signal_stats(signals),
             generated_at=datetime.now(tz=UTC).isoformat(),
         )
 
@@ -250,6 +344,7 @@ class ReportGenerator:
         end_time = start_time + timedelta(days=7)
 
         trades = self._get_trades_for_period(start_time, end_time)
+        signals = self._get_signals_for_period(start_time, end_time)
         equity_history = self._get_equity_history_for_period(start_time, end_time)
 
         # Calculate metrics
@@ -285,6 +380,7 @@ class ReportGenerator:
             avg_r_multiple=sum(r_multiples) / total_trades if total_trades > 0 else 0,
             max_drawdown_pct=self._calculate_max_drawdown(equity_history),
             strategy_breakdown=self._calculate_strategy_stats(trades),
+            signal_stats=self._calculate_signal_stats(signals),
             generated_at=datetime.now(tz=UTC).isoformat(),
         )
 
@@ -339,6 +435,38 @@ class ReportGenerator:
             "",
         ]
 
+        signal_stats = report.signal_stats or {}
+        if signal_stats.get("total_signals", 0) > 0:
+            lines.extend([
+                "## Signal Forecasts",
+                "",
+                "| Metric | Value |",
+                "|--------|-------|",
+                f"| Total Signals | {signal_stats.get('total_signals', 0)} |",
+                f"| Opened Signals | {signal_stats.get('opened_signals', 0)} |",
+                f"| Blocked/Skipped Signals | {signal_stats.get('blocked_signals', 0)} |",
+                f"| Succeeded / Failed | {signal_stats.get('succeeded_signals', 0)} / {signal_stats.get('failed_signals', 0)} |",
+                f"| Signal Success Rate | {signal_stats.get('success_rate', 0):.1%} |",
+                f"| Signal Open Rate | {signal_stats.get('open_rate', 0):.1%} |",
+                f"| Avg Quality Score | {signal_stats.get('avg_quality_score', 0):.1f} |",
+                "",
+            ])
+
+            by_module = signal_stats.get("by_module") or {}
+            if by_module:
+                lines.extend([
+                    "### Signal Breakdown by Module",
+                    "",
+                    "| Strategy | Signals | Opened | Blocked | Success Rate | Avg Quality |",
+                    "|----------|---------|--------|---------|--------------|-------------|",
+                ])
+                for module, stats in by_module.items():
+                    lines.append(
+                        f"| {module} | {stats.get('total_signals', 0)} | "
+                        f"{stats.get('opened_signals', 0)} | {stats.get('blocked_signals', 0)} | "
+                        f"{stats.get('success_rate', 0):.1%} | {stats.get('avg_quality_score', 0):.1f} |"
+                    )
+                lines.append("")
         if report.strategy_breakdown:
             lines.extend([
                 "## Strategy Breakdown",

@@ -148,6 +148,64 @@ class TradingBot:
             f"{sig.strategy_module.value}|{round(sig.entry, 6)}|{candle_open_time}"
         )
 
+
+    def _quality_for_signal(self, sig: Signal, snapshot: MarketSnapshot, strategy_reason: str) -> tuple[float, str]:
+        score = 45.0
+        score += min(max(sig.risk_multiple, 0.0), 3.0) * 9.0
+        if sig.market == MarketType.SPOT and sig.direction == Direction.LONG:
+            score += 6.0
+        if sig.market == MarketType.PERP:
+            score -= 3.0
+        if self.cfg.enable_mtf_confirmation:
+            score += 5.0
+        if snapshot.quote_volume_24h >= 10_000_000:
+            score += 5.0
+        if "setup" in strategy_reason.lower():
+            score += 4.0
+        score = round(max(5.0, min(score, 95.0)), 1)
+        if score >= 75:
+            return score, "high"
+        if score >= 55:
+            return score, "medium"
+        return score, "low"
+
+    def _journal_signal(self, sig: Signal, snapshot: MarketSnapshot, strategy_reason: str) -> None:
+        candle_open_time = snapshot.candles[-1].open_time if snapshot.candles else int(time.time() * 1000)
+        signal_key = self._signal_fingerprint(sig, candle_open_time)
+        quality_score, quality_label = self._quality_for_signal(sig, snapshot, strategy_reason)
+        signal_id = self.state_store.add_signal(
+            {
+                "signal_key": signal_key,
+                "generated_at_utc": sig.timestamp_utc,
+                "symbol": sig.symbol,
+                "market": sig.market.value,
+                "direction": sig.direction.value,
+                "entry": sig.entry,
+                "stop": sig.stop,
+                "target_1": sig.target_1,
+                "target_2": sig.target_2,
+                "risk_multiple": sig.risk_multiple,
+                "regime": sig.regime.value,
+                "strategy_module": sig.strategy_module.value,
+                "rationale": sig.rationale,
+                "strategy_reason": strategy_reason,
+                "quality_score": quality_score,
+                "quality_label": quality_label,
+                "status": "GENERATED",
+                "status_reason": "Strategy module produced a tradable setup",
+                "profile_id": self.cfg.profile_id,
+            },
+            profile_id=self.cfg.profile_id,
+        )
+        sig.signal_id = signal_id
+
+    @staticmethod
+    def _signal_close_status(trade_pnl: float, close_reason: str) -> str:
+        if trade_pnl > 0:
+            return "SUCCEEDED"
+        if close_reason.startswith("TAKE_PROFIT"):
+            return "SUCCEEDED"
+        return "FAILED"
     def _choose_best_candidate(self, candidates: List[Candidate]) -> Candidate | None:
         if not candidates:
             return None
@@ -318,6 +376,25 @@ class TradingBot:
                             "profile_id": self.cfg.profile_id,
                         }
                     )
+                    signal_status = self._signal_close_status(trade.pnl, trade.close_reason)
+                    self.state_store.update_signal(
+                        trade.signal_id,
+                        signal_status,
+                        f"Paper trade closed: {trade.close_reason}",
+                        closed_at_utc=trade.closed_at_utc,
+                        exit_price=trade.exit_price,
+                        pnl=trade.pnl,
+                        r_multiple=r_mult,
+                        close_reason=trade.close_reason,
+                    )
+                else:
+                    self.state_store.update_signal(
+                        trade.signal_id,
+                        "OPENED",
+                        f"Partial paper exit recorded: {trade.close_reason}",
+                        pnl=trade.pnl,
+                        close_reason=trade.close_reason,
+                    )
                 if not is_partial:
                     self._record_module_result(trade.strategy_module, trade.pnl)
                 if risk_state["day_locked"]:
@@ -343,6 +420,12 @@ class TradingBot:
 
         if self.execution.pending_order is not None:
             pending = self.execution.pending_order
+            if pending.expired(datetime.now(tz=UTC)):
+                self.state_store.update_signal(
+                    pending.signal.signal_id,
+                    "EXPIRED",
+                    "Paper limit order timed out before fill",
+                )
             snap = self.data.fetch_snapshot(pending.signal.symbol, pending.signal.market, self.cfg.timeframe)
             if snap is not None:
                 rules = self._get_rules(snap.symbol, snap.market)
@@ -351,6 +434,12 @@ class TradingBot:
                     self.risk.register_new_trade(pos.symbol)
                     self.alerts.notify_signal(pending.signal)
                     LOG.info("Filled pending limit order for %s", pos.symbol)
+                    self.state_store.update_signal(
+                        pending.signal.signal_id,
+                        "OPENED",
+                        "Pending paper limit order filled",
+                        opened_at_utc=pos.opened_at_utc,
+                    )
                     self.state_store.update_state(
                         open_position={
                             "symbol": pos.symbol,
@@ -379,9 +468,11 @@ class TradingBot:
                 if decision.signal is None:
                     continue
                 sig = decision.signal
+                self._journal_signal(sig, snap, decision.reason)
                 disabled, reason = self._is_module_temporarily_disabled(sig.strategy_module)
                 if disabled:
                     LOG.info("Module scorecard blocked %s: %s", sig.strategy_module.value, reason)
+                    self.state_store.update_signal(sig.signal_id, "BLOCKED_BY_MODULE_SCORECARD", reason)
                     continue
 
                 if self.cfg.enable_mtf_confirmation:
@@ -395,14 +486,17 @@ class TradingBot:
                             sig.strategy_module.value,
                             mtf_reason,
                         )
+                        self.state_store.update_signal(sig.signal_id, "BLOCKED_BY_MTF", mtf_reason)
                         continue
 
                 # Spot/perps routing rules.
                 if sig.direction == Direction.SHORT and sig.market != MarketType.PERP:
+                    self.state_store.update_signal(sig.signal_id, "BLOCKED_BY_EXECUTION", "Spot short signal skipped; shorts require perp market")
                     continue
                 ok_funding, funding_reason = self._funding_filter(sig, snap)
                 if not ok_funding:
                     LOG.info("Funding filter blocked %s %s: %s", sig.symbol, sig.market.value, funding_reason)
+                    self.state_store.update_signal(sig.signal_id, "BLOCKED_BY_FUNDING", funding_reason)
                     self.alerts.notify(
                         "FUNDING_SPIKE_WARNING",
                         {"symbol": sig.symbol, "market": sig.market.value, "reason": funding_reason},
@@ -411,6 +505,7 @@ class TradingBot:
                 trend_ok, trend_reason = self._funding_trend_ok(sig, snap)
                 if not trend_ok:
                     LOG.info("Funding trend blocked %s %s: %s", sig.symbol, sig.market.value, trend_reason)
+                    self.state_store.update_signal(sig.signal_id, "BLOCKED_BY_FUNDING", trend_reason)
                     self.alerts.notify(
                         "FUNDING_TREND_WARNING",
                         {"symbol": sig.symbol, "market": sig.market.value, "reason": trend_reason},
@@ -429,21 +524,32 @@ class TradingBot:
             self._sync_runtime_state()
             return
 
+        for candidate in candidates:
+            if candidate is not chosen:
+                self.state_store.update_signal(
+                    candidate.signal.signal_id,
+                    "NOT_SELECTED",
+                    "Another valid candidate had higher routing priority or risk multiple",
+                )
+
         sig = chosen.signal
         snap = chosen.snapshot
         fingerprint = self._signal_fingerprint(sig, snap.candles[-1].open_time)
         if self.last_fingerprint_by_symbol.get(sig.symbol) == fingerprint:
             LOG.info("No fresh signal for %s", sig.symbol)
+            self.state_store.update_signal(sig.signal_id, "DUPLICATE", "Signal already processed for this candle")
             return
 
         risk_decision = self.risk.pre_trade_check(sig)
         if not risk_decision.approved:
             LOG.info("Risk blocked signal: %s", risk_decision.reason)
+            self.state_store.update_signal(sig.signal_id, "BLOCKED_BY_RISK", risk_decision.reason)
             return
 
         exec_decision = self.execution.execution_check(snap, sig.direction)
         if not exec_decision.approved:
             LOG.info("Execution blocked signal: %s", exec_decision.reason)
+            self.state_store.update_signal(sig.signal_id, "BLOCKED_BY_EXECUTION", exec_decision.reason)
             return
 
         rules = self._get_rules(sig.symbol, sig.market)
@@ -452,14 +558,22 @@ class TradingBot:
             pos = self.execution.place_limit_order(sig, risk_decision.quantity, rules, snapshot=snap)
             if pos is None:
                 LOG.info("Placed limit order for %s", sig.symbol)
+                self.state_store.update_signal(sig.signal_id, "PENDING_ORDER", "Paper limit order placed and waiting for fill")
         else:
             pos = self.execution.open_trade(sig, risk_decision.quantity, rules, snapshot=snap)
         if pos is None:
             if self.cfg.enable_limit_orders:
                 return
             LOG.info("Could not open simulated position due to filters/notional/qty")
+            self.state_store.update_signal(sig.signal_id, "BLOCKED_BY_EXECUTION", "Symbol filters, notional, or quantity prevented paper open")
             return
 
+        self.state_store.update_signal(
+            sig.signal_id,
+            "OPENED",
+            "Paper trade opened",
+            opened_at_utc=pos.opened_at_utc,
+        )
         self.risk.register_new_trade(sig.symbol)
         self.last_fingerprint_by_symbol[sig.symbol] = fingerprint
         self.alerts.notify_signal(sig)

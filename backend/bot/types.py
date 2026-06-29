@@ -127,6 +127,7 @@ class Signal:
     rationale: str
     risk_multiple: float
     timestamp_utc: str = field(default_factory=lambda: datetime.now(tz=timezone.utc).isoformat())
+    signal_id: Optional[int] = None
 
 
 @dataclass
@@ -157,6 +158,7 @@ class Position:
     tp_hit_count: int = 0
     trailing_active: bool = False
     trail_anchor: float = 0.0
+    signal_id: Optional[int] = None
 
 
 @dataclass
@@ -177,3 +179,4 @@ class ClosedTrade:
     partial_exit: bool
     opened_at_utc: str
     closed_at_utc: str
+    signal_id: Optional[int] = None

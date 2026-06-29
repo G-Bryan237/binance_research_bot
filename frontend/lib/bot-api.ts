@@ -115,6 +115,13 @@ type MarketPayload = {
 };
 
 const MARKET_STALE_AFTER_MS = 30 * 60 * 1000;
+const BINANCE_KLINE_ENDPOINTS = [
+  "https://api.binance.com/api/v3/klines",
+  "https://api1.binance.com/api/v3/klines",
+  "https://api2.binance.com/api/v3/klines",
+  "https://api3.binance.com/api/v3/klines",
+  "https://data-api.binance.vision/api/v3/klines",
+];
 
 function getDefaultBackendBaseUrl(): string {
   const raw = process.env.PYTHON_BACKEND_BASE_URL || "http://127.0.0.1:5000";
@@ -258,28 +265,34 @@ function normalizeBinanceKline(row: unknown): MarketCandle | null {
 }
 
 async function fetchLiveMarketPayload(symbol: string, limit = 120): Promise<MarketPayload | null> {
-  const url = new URL("https://api.binance.com/api/v3/klines");
-  url.searchParams.set("symbol", symbol.toUpperCase());
-  url.searchParams.set("interval", "5m");
-  url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1000))));
+  for (const endpoint of BINANCE_KLINE_ENDPOINTS) {
+    const url = new URL(endpoint);
+    url.searchParams.set("symbol", symbol.toUpperCase());
+    url.searchParams.set("interval", "5m");
+    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1000))));
 
-  try {
-    const response = await fetch(url, {
-      headers: { Accept: "application/json" },
-      cache: "no-store",
-      next: { revalidate: 0 },
-    });
+    try {
+      const response = await fetch(url, {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        next: { revalidate: 0 },
+      });
 
-    if (!response.ok) {
-      return null;
+      if (!response.ok) {
+        continue;
+      }
+
+      const raw = (await response.json()) as unknown[];
+      const candles = raw.map(normalizeBinanceKline).filter((candle): candle is MarketCandle => candle !== null);
+      if (candles.length > 0) {
+        return { symbol: symbol.toUpperCase(), candles };
+      }
+    } catch {
+      // Try the next public market-data endpoint.
     }
-
-    const raw = (await response.json()) as unknown[];
-    const candles = raw.map(normalizeBinanceKline).filter((candle): candle is MarketCandle => candle !== null);
-    return candles.length > 0 ? { symbol: symbol.toUpperCase(), candles } : null;
-  } catch {
-    return null;
   }
+
+  return null;
 }
 
 async function getFreshMarketPayload(pathWithQuery: string): Promise<MarketPayload | null> {
@@ -288,14 +301,11 @@ async function getFreshMarketPayload(pathWithQuery: string): Promise<MarketPaylo
 }
 
 async function readMarketCandles(symbol: string, limit = 120): Promise<MarketCandle[]> {
-  const dataDir = path.join(getProjectRoot(), "data");
+  const projectRoot = getProjectRoot();
+  const dataDirs = [path.join(projectRoot, "data"), path.join(projectRoot, "backend", "data")];
   const normalizedSymbol = symbol.toUpperCase();
-  const candidates = [
-    path.join(dataDir, `${normalizedSymbol}_SPOT_5m.csv`),
-    path.join(dataDir, `${normalizedSymbol}_SPOT_1m.csv`),
-    path.join(dataDir, `${normalizedSymbol}.csv`),
-  ];
-
+  const filenames = [`${normalizedSymbol}_SPOT_5m.csv`, `${normalizedSymbol}_SPOT_1m.csv`, `${normalizedSymbol}.csv`];
+  const candidates = dataDirs.flatMap((dataDir) => filenames.map((filename) => path.join(dataDir, filename)));
   let found: string | null = null;
   for (const candidate of candidates) {
     try {
@@ -461,6 +471,12 @@ export async function proxyToBackend(pathWithQuery: string): Promise<Response> {
       const livePayload = await getFreshMarketPayload(pathWithQuery);
       if (livePayload) {
         return jsonResponse(livePayload, 200, "binance-live");
+      }
+
+      const { symbol, limit } = parseMarketParams(pathWithQuery);
+      const fallbackCandles = await readMarketCandles(symbol, limit);
+      if (fallbackCandles.length > 0) {
+        return jsonResponse({ symbol, candles: fallbackCandles }, 200, "fallback");
       }
     }
 

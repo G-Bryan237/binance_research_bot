@@ -68,6 +68,27 @@ class BotApiServer:
         self.app: Flask | None = None
         self.socketio: SocketIO | None = None
 
+    def _market_data_candidates(self, symbol: str) -> list[Path]:
+        filenames = [
+            f"{symbol}_SPOT_5m.csv",
+            f"{symbol}_SPOT_1m.csv",
+            f"{symbol}.csv",
+        ]
+        package_data_dir = Path(__file__).resolve().parents[1] / "data"
+        repo_data_dir = Path(__file__).resolve().parents[2] / "data"
+        data_dirs = [self.data_dir, package_data_dir, repo_data_dir]
+
+        candidates: list[Path] = []
+        seen: set[str] = set()
+        for data_dir in data_dirs:
+            for filename in filenames:
+                candidate = data_dir / filename
+                key = str(candidate.resolve()) if candidate.is_absolute() else str(candidate)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(candidate)
+        return candidates
+
     def initialize(self) -> bool:
         if not HAS_FLASK:
             LOG.error("Flask is not installed. Install dependencies in requirements.txt")
@@ -135,15 +156,21 @@ class BotApiServer:
             limit = int(request.args.get("limit") or 200)
             return jsonify({"trades": self.state_store.get_trades(limit=limit)})
 
+        @self.app.route("/api/signals")
+        def get_signals():
+            limit = int(request.args.get("limit") or 200)
+            return jsonify(
+                {
+                    "signals": self.state_store.get_signals(limit=limit),
+                    "stats": self.state_store.get_signal_stats(),
+                }
+            )
+
         @self.app.route("/api/market")
         def get_market():
             symbol = (request.args.get("symbol") or "BTCUSDT").upper()
             limit = int(request.args.get("limit") or 120)
-            candidates = [
-                self.data_dir / f"{symbol}_SPOT_5m.csv",
-                self.data_dir / f"{symbol}_SPOT_1m.csv",
-                self.data_dir / f"{symbol}.csv",
-            ]
+            candidates = self._market_data_candidates(symbol)
             found = None
             for path in candidates:
                 if path.exists():
@@ -182,7 +209,9 @@ class BotApiServer:
             live_endpoints = [
                 "https://api.binance.com/api/v3/klines",
                 "https://api1.binance.com/api/v3/klines",
+                "https://api2.binance.com/api/v3/klines",
                 "https://api3.binance.com/api/v3/klines",
+                "https://data-api.binance.vision/api/v3/klines",
             ]
             params = urlencode(
                 {

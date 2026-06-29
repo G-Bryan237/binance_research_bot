@@ -331,6 +331,7 @@ class PaperExecutionEngine:
             regime=signal.regime,
             trailing_active=self.cfg.enable_trailing_stop and self.cfg.enable_trailing_on_full_position,
             trail_anchor=fill_price,
+            signal_id=signal.signal_id,
         )
         self.open_positions[(signal.symbol, signal.market)] = pos
         return pos
@@ -449,6 +450,7 @@ class PaperExecutionEngine:
             partial_exit=qty < pos.quantity,
             opened_at_utc=pos.opened_at_utc,
             closed_at_utc=_now_iso(),
+            signal_id=pos.signal_id,
         )
 
     def mark_to_market(self, snapshot: MarketSnapshot) -> list[ClosedTrade]:

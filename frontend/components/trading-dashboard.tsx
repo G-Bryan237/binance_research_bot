@@ -43,6 +43,52 @@ type EquityPoint = {
   equity: number;
 };
 
+type SignalJournal = {
+  id: number;
+  generated_at_utc: string;
+  updated_at_utc: string;
+  symbol: string;
+  market: string;
+  direction: string;
+  entry: number;
+  stop: number;
+  target_1: number;
+  target_2: number;
+  risk_multiple: number;
+  regime: string;
+  strategy_module: string;
+  rationale: string;
+  strategy_reason: string;
+  quality_score: number;
+  quality_label: string;
+  status: string;
+  status_reason: string;
+  opened_at_utc?: string | null;
+  closed_at_utc?: string | null;
+  exit_price?: number | null;
+  pnl?: number | null;
+  r_multiple?: number | null;
+  close_reason?: string | null;
+  profile_id?: string;
+};
+
+type SignalStats = {
+  total_signals: number;
+  opened_signals: number;
+  blocked_signals: number;
+  succeeded_signals: number;
+  failed_signals: number;
+  open_signals?: number;
+  success_rate: number;
+  open_rate: number;
+  avg_quality_score?: number;
+  by_module?: Record<string, SignalStats>;
+};
+
+type SignalsResponse = {
+  signals: SignalJournal[];
+  stats: SignalStats;
+};
 type BotState = {
   status: string;
   current_tick: string | null;
@@ -58,6 +104,8 @@ type BotState = {
   equity_history?: EquityPoint[];
   module_scores: Record<string, ModuleScore>;
   trading_stats: TradingStats;
+  recent_signals: SignalJournal[];
+  signal_stats: SignalStats;
 };
 
 type HealthResponse = {
@@ -100,7 +148,7 @@ type RouteStatus = {
 
 type Theme = "dark" | "light";
 type TradeFilter = "all" | "wins" | "losses";
-type DashboardView = "overview" | "markets" | "strategies" | "trades" | "system" | "reports";
+type DashboardView = "overview" | "markets" | "strategies" | "signals" | "trades" | "system" | "reports";
 type ReportPeriod = "daily" | "weekly" | "monthly";
 
 type LiveTicker = {
@@ -115,6 +163,7 @@ const DASHBOARD_VIEWS: Array<{ id: DashboardView; label: string; short: string }
   { id: "overview", label: "Overview", short: "OV" },
   { id: "markets", label: "Markets", short: "MK" },
   { id: "strategies", label: "Strategy Trades", short: "ST" },
+  { id: "signals", label: "Signals", short: "SG" },
   { id: "reports", label: "Reports", short: "RP" },
   { id: "system", label: "System", short: "SY" },
 ];
@@ -160,6 +209,19 @@ const EMPTY_STATE: BotState = {
     losing_trades: 0,
     win_rate: 0,
     avg_r_multiple: 0,
+  },
+  recent_signals: [],
+  signal_stats: {
+    total_signals: 0,
+    opened_signals: 0,
+    blocked_signals: 0,
+    succeeded_signals: 0,
+    failed_signals: 0,
+    open_signals: 0,
+    success_rate: 0,
+    open_rate: 0,
+    avg_quality_score: 0,
+    by_module: {},
   },
 };
 
@@ -276,6 +338,8 @@ function mergeState(current: BotState | null, patch: Partial<BotState>): BotStat
     equity_history: patch.equity_history ?? base.equity_history,
     module_scores: patch.module_scores ?? base.module_scores,
     trading_stats: patch.trading_stats ?? base.trading_stats,
+    recent_signals: patch.recent_signals ?? base.recent_signals,
+    signal_stats: patch.signal_stats ?? base.signal_stats,
   };
 }
 
@@ -283,6 +347,28 @@ function statusClass(status: string | undefined): string {
   return (status || "initializing").toLowerCase().replace(/[^a-z0-9]+/g, "-");
 }
 
+
+function signalStatusClass(status: string | undefined): string {
+  return (status || "generated").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+}
+
+function signalTone(status: string | undefined): "neutral" | "positive" | "negative" {
+  const normalized = (status || "").toUpperCase();
+  if (normalized === "SUCCEEDED" || normalized === "OPENED") {
+    return "positive";
+  }
+  if (normalized === "FAILED" || normalized.startsWith("BLOCKED") || normalized === "EXPIRED") {
+    return "negative";
+  }
+  return "neutral";
+}
+
+function formatSignalResult(signal: SignalJournal): string {
+  if (signal.pnl === null || signal.pnl === undefined) {
+    return signal.close_reason || "-";
+  }
+  return `${formatSignedCurrency(signal.pnl)}${signal.r_multiple !== null && signal.r_multiple !== undefined ? ` / ${signal.r_multiple.toFixed(2)}R` : ""}`;
+}
 function buildLinePath(values: number[], height = 42): string {
   const cleanValues = values.filter((value) => Number.isFinite(value));
   if (cleanValues.length < 2) {
@@ -428,15 +514,17 @@ export function TradingDashboard({
   }, [theme]);
 
   const loadData = useCallback(async () => {
-    const stateUrl = apiBase ? `${apiBase}/api/state` : "/api/bot/state";
-    const statsUrl = apiBase ? `${apiBase}/api/stats` : "/api/bot/stats";
-    const tradesUrl = apiBase ? `${apiBase}/api/trades` : "/api/bot/trades";
-    const healthUrl = apiBase ? `${apiBase}/api/health` : "/api/bot/health";
+    const stateUrl = apiBase ? `${apiBase}/api/state` : buildApiUrl("/api/bot/state");
+    const statsUrl = apiBase ? `${apiBase}/api/stats` : buildApiUrl("/api/bot/stats");
+    const tradesUrl = apiBase ? `${apiBase}/api/trades` : buildApiUrl("/api/bot/trades");
+    const signalsUrl = apiBase ? `${apiBase}/api/signals` : buildApiUrl("/api/bot/signals");
+    const healthUrl = apiBase ? `${apiBase}/api/health` : buildApiUrl("/api/bot/health");
     
-    const [stateResult, statsResult, tradesResult, healthResult, marketResults] = await Promise.all([
+    const [stateResult, statsResult, tradesResult, signalsResult, healthResult, marketResults] = await Promise.all([
       settleFetch<BotState>("state", stateUrl),
       settleFetch<TradingStats>("stats", statsUrl),
       settleFetch<TradesResponse>("trades", tradesUrl),
+      settleFetch<SignalsResponse>("signals", signalsUrl),
       settleFetch<HealthResponse>("health", healthUrl),
       Promise.all(
         MARKET_SYMBOLS.map((symbol) => {
@@ -448,7 +536,7 @@ export function TradingDashboard({
       ),
     ]);
 
-    setRouteStatuses([stateResult, statsResult, tradesResult, healthResult, ...marketResults].map((item) => item.status));
+    setRouteStatuses([stateResult, statsResult, tradesResult, signalsResult, healthResult, ...marketResults].map((item) => item.status));
 
     if (!stateResult.result) {
       setError(stateResult.status.detail);
@@ -468,6 +556,8 @@ export function TradingDashboard({
         ...stateFetch.data,
         trading_stats: statsResult.result?.data ?? stateFetch.data.trading_stats,
         recent_trades: tradesResult.result?.data.trades ?? stateFetch.data.recent_trades,
+        recent_signals: signalsResult.result?.data.signals ?? stateFetch.data.recent_signals,
+        signal_stats: signalsResult.result?.data.stats ?? stateFetch.data.signal_stats,
       }),
     );
     setHealth(healthResult.result?.data ?? null);
@@ -477,7 +567,7 @@ export function TradingDashboard({
     setError("");
     setLastRefresh(new Date().toISOString());
     setIsLoading(false);
-  }, [apiBase]);
+  }, [apiBase, buildApiUrl]);
 
   const handleBalanceAdjust = useCallback(async () => {
     const newBalance = parseFloat(balanceInput);
@@ -658,6 +748,8 @@ export function TradingDashboard({
   const routeOkCount = routeStatuses.filter((route) => route.ok).length;
   const activeModulesCount = Object.values(activeState.module_scores).filter((score) => score.active).length;
   const latestTrade = activeState.recent_trades[0];
+  const latestSignal = activeState.recent_signals[0];
+  const signalStats = activeState.signal_stats ?? EMPTY_STATE.signal_stats;
   const activeModuleEntry = Object.entries(activeState.module_scores).find(([, score]) => score.active);
   const appliedStrategyCode = normalizeStrategyCode(
     activeState.open_position ? latestTrade?.strategy_module : latestTrade?.strategy_module || activeModuleEntry?.[0],
@@ -676,8 +768,8 @@ export function TradingDashboard({
   );
 
   const tradeSymbols = useMemo(
-    () => Array.from(new Set([...MARKET_SYMBOLS, ...activeState.recent_trades.map((trade) => trade.symbol)])).sort(),
-    [activeState.recent_trades],
+    () => Array.from(new Set([...MARKET_SYMBOLS, ...activeState.recent_trades.map((trade) => trade.symbol), ...activeState.recent_signals.map((signal) => signal.symbol)])).sort(),
+    [activeState.recent_trades, activeState.recent_signals],
   );
 
   const strategyOptions = useMemo(
@@ -687,9 +779,10 @@ export function TradingDashboard({
           ...CONFIGURED_STRATEGIES,
           ...moduleEntries.map(([moduleName]) => normalizeStrategyCode(moduleName)).filter(Boolean),
           ...activeState.recent_trades.map((trade) => normalizeStrategyCode(trade.strategy_module)).filter(Boolean),
+          ...activeState.recent_signals.map((signal) => normalizeStrategyCode(signal.strategy_module)).filter(Boolean),
         ]),
       ),
-    [activeState.recent_trades, moduleEntries],
+    [activeState.recent_trades, activeState.recent_signals, moduleEntries],
   );
 
   const filteredTrades = useMemo(() => {
@@ -729,6 +822,38 @@ export function TradingDashboard({
     });
   }, [activeState.recent_trades, dateFrom, dateTo, selectedStrategy, selectedSymbol, tradeFilter]);
 
+
+  const filteredSignals = useMemo(() => {
+    const fromTime = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
+    const toTime = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
+    const allowedSymbols = new Set(MARKET_SYMBOLS);
+
+    return activeState.recent_signals.filter((signal) => {
+      if (!allowedSymbols.has(signal.symbol)) {
+        return false;
+      }
+      if (selectedStrategy !== "all" && normalizeStrategyCode(signal.strategy_module) !== selectedStrategy) {
+        return false;
+      }
+      if (selectedSymbol !== "all" && signal.symbol !== selectedSymbol) {
+        return false;
+      }
+      const signalTime = new Date(signal.generated_at_utc).getTime();
+      if (Number.isNaN(signalTime)) {
+        return fromTime === null && toTime === null;
+      }
+      if (fromTime !== null && signalTime < fromTime) {
+        return false;
+      }
+      if (toTime !== null && signalTime > toTime) {
+        return false;
+      }
+      return true;
+    });
+  }, [activeState.recent_signals, dateFrom, dateTo, selectedStrategy, selectedSymbol]);
+
+  const filteredSignalSuccesses = filteredSignals.filter((signal) => signal.status === "SUCCEEDED").length;
+  const filteredSignalFailures = filteredSignals.filter((signal) => signal.status === "FAILED").length;
   const selectedStrategyTradeCount =
     selectedStrategy === "all"
       ? activeState.recent_trades.length
@@ -771,6 +896,22 @@ export function TradingDashboard({
           ))}
         </nav>
 
+        <button className="rail-signal-card" type="button" onClick={() => setActiveView("signals")}>
+          <span className="rail-signal-label">Latest Signal</span>
+          {latestSignal ? (
+            <>
+              <strong>{latestSignal.symbol} {latestSignal.direction}</strong>
+              <span>{latestSignal.status} / {strategyLabel(latestSignal.strategy_module)}</span>
+              <small>Entry {formatCurrency(latestSignal.entry)} / SL {formatCurrency(latestSignal.stop)}</small>
+              <small>TP {formatCurrency(latestSignal.target_1)} / {formatCurrency(latestSignal.target_2)}</small>
+            </>
+          ) : (
+            <>
+              <strong>No signal yet</strong>
+              <span>Waiting for a valid setup</span>
+            </>
+          )}
+        </button>
         <div className="rail-status">
           <span className={`route-dot ${priceStreamConnected ? "ok" : "fail"}`} />
           <div>
@@ -849,19 +990,6 @@ export function TradingDashboard({
         ) : priceStreamIssue ? (
           <section className="alert alert-warning">{priceStreamIssue}</section>
         ) : null}
-
-        <section className="pair-ticker-strip" aria-label="Live crypto pairs">
-          {marketCards.map((item) => (
-            <button key={item.symbol} type="button" className="pair-ticker-card pair-ticker-button" onClick={() => { setSelectedSymbol(item.symbol); setActiveView("strategies"); }}>
-              <div>
-                <strong>{item.symbol}</strong>
-                <span>{item.isLive ? "live trade" : "REST candle"}</span>
-              </div>
-              <p>{item.price ? formatCurrency(item.price) : "-"}</p>
-              <em className={item.change >= 0 ? "positive" : "negative"}>{formatPercent(item.changePct)}</em>
-            </button>
-          ))}
-        </section>
 
         {activeView === "overview" ? (
           <>
@@ -1113,22 +1241,170 @@ export function TradingDashboard({
                 </div>
                 <span>{priceStreamConnected ? "streaming" : "REST"}</span>
               </div>
-              <div className="pair-ticker-grid pair-ticker-grid-panel">
-                {marketCards.map((item) => (
-                  <div key={item.symbol} className="pair-ticker-card">
-                    <div>
-                      <strong>{item.symbol}</strong>
-                      <span>{item.isLive ? "live trade" : "REST candle"}</span>
-                    </div>
-                    <p>{item.price ? formatCurrency(item.price) : "-"}</p>
-                    <em className={item.change >= 0 ? "positive" : "negative"}>{formatPercent(item.changePct)}</em>
-                  </div>
-                ))}
+              <div className="signal-details-wrap market-watchlist-wrap">
+                <table className="signal-details-table market-watchlist-table">
+                  <thead>
+                    <tr>
+                      <th>Pair</th>
+                      <th>Price</th>
+                      <th>Move</th>
+                      <th>Source</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {marketCards.map((item) => (
+                      <tr key={item.symbol}>
+                        <td><strong>{item.symbol}</strong></td>
+                        <td>{item.price ? formatCurrency(item.price) : "-"}</td>
+                        <td className={item.change >= 0 ? "positive" : "negative"}>{formatPercent(item.changePct)}</td>
+                        <td>{item.isLive ? "live trade" : "REST candle"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </article>
           </section>
         ) : null}
 
+        {activeView === "signals" ? (
+          <section className="signals-page-grid">
+            <header className="signals-header">
+              <div>
+                <p className="panel-kicker">Forecast Journal</p>
+                <h2>Trading Signals</h2>
+              </div>
+              <span>{filteredSignals.length} shown / {activeState.recent_signals.length} total</span>
+            </header>
+
+            <section className="signals-metrics-strip">
+              <ReportMetricCard
+                label="Signals"
+                value={signalStats.total_signals.toString()}
+                tone="neutral"
+                foot={`${signalStats.opened_signals} opened / ${signalStats.blocked_signals} blocked`}
+              />
+              <ReportMetricCard
+                label="Success Rate"
+                value={signalStats.succeeded_signals + signalStats.failed_signals > 0 ? formatPercent(signalStats.success_rate) : "N/A"}
+                tone={signalStats.success_rate >= 0.5 ? "positive" : "neutral"}
+                foot={`${signalStats.succeeded_signals} succeeded / ${signalStats.failed_signals} failed`}
+              />
+              <ReportMetricCard
+                label="Open Rate"
+                value={signalStats.total_signals > 0 ? formatPercent(signalStats.open_rate) : "N/A"}
+                tone="neutral"
+                foot={`${signalStats.open_signals ?? 0} currently open or pending`}
+              />
+              <ReportMetricCard
+                label="Filtered Result"
+                value={`${filteredSignalSuccesses} / ${filteredSignalFailures}`}
+                tone={filteredSignalSuccesses >= filteredSignalFailures ? "positive" : "negative"}
+                foot="Succeeded / failed in current filter"
+              />
+            </section>
+
+            <article className="panel signals-panel">
+              <div className="panel-header signals-panel-header">
+                <div>
+                  <p className="panel-kicker">Details</p>
+                  <h2>Signal Details</h2>
+                </div>
+                <span>{latestSignal ? `${latestSignal.symbol} ${latestSignal.status}` : "waiting"}</span>
+              </div>
+
+              <div className="trade-filter-bar signal-filter-bar" aria-label="Signal filters">
+                <label>
+                  <span>Strategy</span>
+                  <select value={selectedStrategy} onChange={(event) => setSelectedStrategy(event.target.value)}>
+                    <option value="all">All strategies</option>
+                    {strategyOptions.map((strategy) => (
+                      <option key={strategy} value={strategy}>{strategy} - {strategyLabel(strategy)}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Pair</span>
+                  <select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value)}>
+                    <option value="all">All pairs</option>
+                    {tradeSymbols.map((symbol) => (
+                      <option key={symbol} value={symbol}>{symbol}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>From</span>
+                  <input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} />
+                </label>
+                <label>
+                  <span>To</span>
+                  <input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
+                </label>
+                <button
+                  className="text-action reset-action"
+                  type="button"
+                  onClick={() => {
+                    setSelectedStrategy("all");
+                    setSelectedSymbol("all");
+                    setDateFrom("");
+                    setDateTo("");
+                  }}
+                >
+                  Reset
+                </button>
+              </div>
+
+              {isLoading ? (
+                <p className="empty-state">Loading signal journal...</p>
+              ) : filteredSignals.length > 0 ? (
+                <div className="signal-details-wrap">
+                  <table className="signal-details-table">
+                    <thead>
+                      <tr>
+                        <th>Time</th>
+                        <th>Pair</th>
+                        <th>Market</th>
+                        <th>Side</th>
+                        <th>Entry</th>
+                        <th>Stop</th>
+                        <th>TP1</th>
+                        <th>TP2</th>
+                        <th>R:R</th>
+                        <th>Quality</th>
+                        <th>Strategy</th>
+                        <th>Status</th>
+                        <th>Result</th>
+                        <th>Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredSignals.map((signal) => (
+                        <tr key={signal.id} className={`signal-row status-${signalStatusClass(signal.status)}`}>
+                          <td>{formatDate(signal.generated_at_utc)}</td>
+                          <td><strong>{signal.symbol}</strong></td>
+                          <td>{signal.market}</td>
+                          <td className={signal.direction === "LONG" ? "positive" : "negative"}>{signal.direction}</td>
+                          <td>{formatCurrency(signal.entry)}</td>
+                          <td>{formatCurrency(signal.stop)}</td>
+                          <td>{formatCurrency(signal.target_1)}</td>
+                          <td>{formatCurrency(signal.target_2)}</td>
+                          <td>{signal.risk_multiple.toFixed(2)}R</td>
+                          <td>{signal.quality_label} / {signal.quality_score.toFixed(1)}</td>
+                          <td>{normalizeStrategyCode(signal.strategy_module)}</td>
+                          <td><span className={`signal-status-pill ${signalTone(signal.status)}`}>{signal.status}</span></td>
+                          <td>{formatSignalResult(signal)}</td>
+                          <td className="signal-reason-cell">{signal.status_reason || signal.strategy_reason || signal.rationale}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="empty-state">No signals match the selected strategy, pair, and date filters.</p>
+              )}
+            </article>
+          </section>
+        ) : null}
         {activeView === "strategies" ? (
           <section className="strategy-trades-grid">
             <article className="panel monitor-panel strategy-panel">
@@ -1436,6 +1712,49 @@ export function TradingDashboard({
               />
             </section>
 
+            <article className="panel signal-report-panel">
+              <div className="panel-header">
+                <div>
+                  <p className="panel-kicker">Signal Forecasts</p>
+                  <h2>Signal Performance by Strategy</h2>
+                </div>
+                <span>{signalStats.total_signals} total</span>
+              </div>
+              {signalStats.by_module && Object.keys(signalStats.by_module).length > 0 ? (
+                <div className="signal-details-wrap report-signal-table-wrap">
+                  <table className="signal-details-table report-signal-table">
+                    <thead>
+                      <tr>
+                        <th>Strategy</th>
+                        <th>Signals</th>
+                        <th>Opened</th>
+                        <th>Blocked</th>
+                        <th>Succeeded</th>
+                        <th>Failed</th>
+                        <th>Success Rate</th>
+                        <th>Open Rate</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(signalStats.by_module).map(([moduleName, stats]) => (
+                        <tr key={moduleName}>
+                          <td><strong>{moduleName}</strong></td>
+                          <td>{stats.total_signals}</td>
+                          <td>{stats.opened_signals}</td>
+                          <td>{stats.blocked_signals}</td>
+                          <td>{stats.succeeded_signals}</td>
+                          <td>{stats.failed_signals}</td>
+                          <td>{stats.succeeded_signals + stats.failed_signals > 0 ? formatPercent(stats.success_rate) : "N/A"}</td>
+                          <td>{stats.total_signals > 0 ? formatPercent(stats.open_rate) : "N/A"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="empty-state">No signal forecast data is available for this profile yet.</p>
+              )}
+            </article>
             <article className="panel strategy-performance-panel">
               <div className="panel-header">
                 <div>
