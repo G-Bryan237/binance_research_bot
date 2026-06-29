@@ -1,0 +1,2 @@
+symbol,market,direction,entry,exit,qty,pnl,fee,funding,close_reason,r_multiple,hold_minutes,strategy_module,regime,opened_at_utc,closed_at_utc
+BTCUSDT,SPOT,LONG,63412.11863962242,61987.66915756424,0.000283,-0.43860734336906937,0.035488139946603825,0.0,STOP_LOSS,-1.1273109734091313,170.0,M1,TREND,2024-01-03T02:05:00+00:00,2024-01-03T04:55:00+00:00

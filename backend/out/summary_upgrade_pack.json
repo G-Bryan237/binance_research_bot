@@ -1,0 +1,34 @@
+{
+  "initial_equity": 50.0,
+  "final_equity": 48.995482543094454,
+  "total_return_pct": -2.0090349138110923,
+  "total_trades": 8,
+  "wins": 2,
+  "losses": 6,
+  "breakeven": 0,
+  "win_rate_pct": 25.0,
+  "profit_factor": 0.008977346489147678,
+  "max_drawdown_pct": 2.0090349138110923,
+  "sharpe_ratio_trade_level": -1.682480860589507,
+  "expectancy_per_trade": -0.1255646821131932,
+  "avg_r_multiple": -0.5433809901838822,
+  "median_r_multiple": -0.4997348369902839,
+  "avg_win": 0.004549795725199233,
+  "avg_loss": -0.16893617472599065,
+  "longest_win_streak": 1,
+  "longest_loss_streak": 4,
+  "by_module": {
+    "M4": {
+      "trades": 7.0,
+      "wins": 2.0,
+      "pnl": -0.5705596613460424,
+      "win_rate_pct": 28.57142857142857
+    },
+    "M1": {
+      "trades": 1.0,
+      "wins": 0.0,
+      "pnl": -0.43395779555950326,
+      "win_rate_pct": 0.0
+    }
+  }
+}

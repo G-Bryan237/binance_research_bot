@@ -15,8 +15,3 @@ frontend/.env.local
 frontend/.env.production
 frontend/tsconfig.tsbuildinfo
 
-# Bot state and data
-out/bot_state.sqlite3
-out/bot_state.sqlite3-shm
-out/bot_state.sqlite3-wal
-out/
