@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from .state_store import BotStateStore
 
@@ -175,33 +178,79 @@ class BotApiServer:
                 except Exception as exc:
                     LOG.warning("Failed to read local market data for %s: %s", symbol, exc)
 
-            # Fallback: fetch live data from Binance API
-            try:
-                import requests as req
-                binance_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
-                resp = req.get(binance_url, timeout=5)
-                if resp.status_code == 200:
-                    data = resp.json()
+            # Fallback: fetch live data from Binance API mirrors for reliability.
+            live_endpoints = [
+                "https://api.binance.com/api/v3/klines",
+                "https://api1.binance.com/api/v3/klines",
+                "https://api3.binance.com/api/v3/klines",
+            ]
+            params = urlencode(
+                {
+                    "symbol": symbol,
+                    "interval": "5m",
+                    "limit": max(1, min(limit, 1000)),
+                }
+            )
+
+            live_errors: list[str] = []
+            for base_url in live_endpoints:
+                try:
+                    url = f"{base_url}?{params}"
+                    req = Request(
+                        url,
+                        headers={
+                            "Accept": "application/json",
+                            "User-Agent": "binance-research-bot/1.0",
+                        },
+                    )
+                    with urlopen(req, timeout=6) as resp:  # nosec B310
+                        body = resp.read().decode("utf-8")
+                    data = json.loads(body)
+                    if not isinstance(data, list):
+                        raise ValueError("unexpected Binance response shape")
+
+                    live_rows = []
                     for candle in data:
-                        rows.append({
-                            "time": int(candle[0]),
-                            "open": float(candle[1]),
-                            "high": float(candle[2]),
-                            "low": float(candle[3]),
-                            "close": float(candle[4]),
-                            "volume": float(candle[5]),
-                        })
-                    return jsonify({"symbol": symbol, "candles": rows, "source": "binance-live"})
-            except Exception as exc:
-                LOG.warning("Failed to fetch live market data for %s: %s", symbol, exc)
+                        if not isinstance(candle, list) or len(candle) < 6:
+                            continue
+                        live_rows.append(
+                            {
+                                "time": int(candle[0]),
+                                "open": float(candle[1]),
+                                "high": float(candle[2]),
+                                "low": float(candle[3]),
+                                "close": float(candle[4]),
+                                "volume": float(candle[5]),
+                            }
+                        )
 
-            if not rows:
-                return (
-                    jsonify({"error": "market data not found", "symbol": symbol}),
-                    404,
-                )
+                    if live_rows:
+                        return jsonify(
+                            {
+                                "symbol": symbol,
+                                "candles": live_rows,
+                                "source": "binance-live",
+                                "endpoint": base_url,
+                            }
+                        )
+                except Exception as exc:
+                    live_errors.append(f"{base_url}: {exc}")
+                    continue
 
-            return jsonify({"symbol": symbol, "candles": rows})
+            if rows:
+                return jsonify({"symbol": symbol, "candles": rows, "source": "local-file-stale"})
+
+            LOG.warning("No market data available for %s. Errors: %s", symbol, " | ".join(live_errors))
+            return (
+                jsonify(
+                    {
+                        "error": "market data unavailable",
+                        "symbol": symbol,
+                        "detail": live_errors[-1] if live_errors else "unknown",
+                    }
+                ),
+                502,
+            )
 
 
         @self.app.route("/api/profile")
