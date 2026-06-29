@@ -1,0 +1,22 @@
+# Environment files with secrets (NEVER commit these!)
+.env
+.env.local
+.env.*.local
+profiles/*.env
+!.env.example
+!profiles/.env.*.example
+
+.venv/
+__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/.env.production
+frontend/tsconfig.tsbuildinfo
+
+# Bot state and data
+out/bot_state.sqlite3
+out/bot_state.sqlite3-shm
+out/bot_state.sqlite3-wal
+out/

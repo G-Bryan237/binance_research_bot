@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # Conservative profile backend
+  backend-conservative:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bot-conservative
+    environment:
+      - BOT_PROFILE_ID=conservative
+    volumes:
+      - ./profiles/conservative.env:/app/.env:ro
+      - ./data:/app/data
+      - bot-conservative-out:/app/out
+      - bot-reports:/app/reports
+    ports:
+      - "5001:5001"
+    command: ["python", "run_multiprofile.py", "--profile", "conservative"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Aggressive profile backend
+  backend-aggressive:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bot-aggressive
+    environment:
+      - BOT_PROFILE_ID=aggressive
+    volumes:
+      - ./profiles/aggressive.env:/app/.env:ro
+      - ./data:/app/data
+      - bot-aggressive-out:/app/out
+      - bot-reports:/app/reports
+    ports:
+      - "5002:5002"
+    command: ["python", "run_multiprofile.py", "--profile", "aggressive"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Report generator (runs scheduled reports)
+  report-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bot-reports
+    volumes:
+      - ./profiles:/app/profiles:ro
+      - bot-conservative-out:/app/out/conservative:ro
+      - bot-aggressive-out:/app/out/aggressive:ro
+      - bot-reports:/app/reports
+    command: ["sh", "-c", "while true; do python run_multiprofile.py --report daily; sleep 86400; done"]
+    restart: unless-stopped
+
+  # Frontend
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: bot-frontend
+    environment:
+      - CONSERVATIVE_API_URL=http://backend-conservative:5001
+      - AGGRESSIVE_API_URL=http://backend-aggressive:5002
+      - NEXT_PUBLIC_CONSERVATIVE_API_URL=http://localhost:5001
+      - NEXT_PUBLIC_AGGRESSIVE_API_URL=http://localhost:5002
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend-conservative
+      - backend-aggressive
+    restart: unless-stopped
+
+volumes:
+  bot-conservative-out:
+  bot-aggressive-out:
+  bot-reports:
