@@ -163,6 +163,7 @@ class BotConfig:
     module_perf_min_trades: int
     module_perf_min_win_rate: float
     module_perf_disable_minutes: int
+    signal_forecast_expiry_candles: int
     # Advanced indicators
     enable_macd: bool
     enable_bollinger_bands: bool
@@ -341,6 +342,7 @@ def load_config(env_file: str = ".env") -> BotConfig:
         module_perf_min_trades=int(os.getenv("BOT_MODULE_PERF_MIN_TRADES", "4")),
         module_perf_min_win_rate=float(os.getenv("BOT_MODULE_PERF_MIN_WIN_RATE", "0.30")),
         module_perf_disable_minutes=int(os.getenv("BOT_MODULE_PERF_DISABLE_MINUTES", "180")),
+        signal_forecast_expiry_candles=int(os.getenv("BOT_SIGNAL_FORECAST_EXPIRY_CANDLES", "12")),
         # Advanced indicators
         enable_macd=_parse_bool(os.getenv("BOT_ENABLE_MACD"), True),
         enable_bollinger_bands=_parse_bool(os.getenv("BOT_ENABLE_BOLLINGER_BANDS"), True),

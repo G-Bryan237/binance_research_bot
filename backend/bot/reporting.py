@@ -106,7 +106,9 @@ class ReportGenerator:
                         generated_at_utc, symbol, market, direction, entry, stop,
                         target_1, target_2, risk_multiple, strategy_module, regime,
                         quality_score, quality_label, status, status_reason, pnl,
-                        r_multiple, close_reason
+                        r_multiple, close_reason, forecast_status, forecast_result,
+                        forecast_reason, forecast_hit_at_utc, forecast_hit_price,
+                        forecast_r_multiple
                     FROM signal_journal
                     WHERE generated_at_utc >= ? AND generated_at_utc < ?
                     ORDER BY generated_at_utc ASC
@@ -131,6 +133,8 @@ class ReportGenerator:
             "DUPLICATE",
             "EXPIRED",
         }
+        forecast_success_results = {"tp1_hit", "tp2_hit"}
+        forecast_failure_results = {"stop_hit"}
         total = len(signals)
         opened = [s for s in signals if s.get("status") in opened_statuses]
         blocked = [s for s in signals if s.get("status") in blocked_statuses or str(s.get("status") or "").startswith("BLOCKED")]
@@ -138,39 +142,89 @@ class ReportGenerator:
         failed = [s for s in signals if s.get("status") == "FAILED"]
         resolved = len(succeeded) + len(failed)
 
+        forecast_successes = [s for s in signals if s.get("forecast_result") in forecast_success_results]
+        forecast_failures = [s for s in signals if s.get("forecast_result") in forecast_failure_results]
+        forecast_expired = [s for s in signals if s.get("forecast_result") == "expired_no_hit"]
+        forecast_watching = [s for s in signals if (s.get("forecast_result") or "watching") == "watching"]
+        forecast_resolved = len(forecast_successes) + len(forecast_failures) + len(forecast_expired)
+        directional_resolved = len(forecast_successes) + len(forecast_failures)
+
         by_module: Dict[str, Dict[str, Any]] = {}
-        for signal in signals:
-            module = str(signal.get("strategy_module") or "UNKNOWN")
-            mod = by_module.setdefault(
-                module,
+        by_quality: Dict[str, Dict[str, Any]] = {}
+
+        def ensure_bucket(container: Dict[str, Dict[str, Any]], key: str) -> Dict[str, Any]:
+            return container.setdefault(
+                key,
                 {
                     "total_signals": 0,
                     "opened_signals": 0,
                     "blocked_signals": 0,
                     "succeeded_signals": 0,
                     "failed_signals": 0,
+                    "forecast_watching": 0,
+                    "forecast_resolved": 0,
+                    "forecast_successes": 0,
+                    "forecast_failures": 0,
+                    "forecast_expired": 0,
+                    "tp1_hits": 0,
+                    "tp2_hits": 0,
+                    "stop_hits": 0,
+                    "expired_no_hit": 0,
                     "success_rate": 0.0,
                     "open_rate": 0.0,
+                    "forecast_success_rate": 0.0,
                     "avg_quality_score": 0.0,
                 },
             )
+
+        for signal in signals:
             status = str(signal.get("status") or "GENERATED")
-            mod["total_signals"] += 1
-            if status in opened_statuses:
-                mod["opened_signals"] += 1
-            if status in blocked_statuses or status.startswith("BLOCKED"):
-                mod["blocked_signals"] += 1
-            if status == "SUCCEEDED":
-                mod["succeeded_signals"] += 1
-            if status == "FAILED":
-                mod["failed_signals"] += 1
-            mod["avg_quality_score"] += float(signal.get("quality_score") or 0.0)
+            forecast_result = str(signal.get("forecast_result") or "watching")
+            buckets = [
+                ensure_bucket(by_module, str(signal.get("strategy_module") or "UNKNOWN")),
+                ensure_bucket(by_quality, str(signal.get("quality_label") or "medium")),
+            ]
+            for bucket in buckets:
+                bucket["total_signals"] += 1
+                bucket["avg_quality_score"] += float(signal.get("quality_score") or 0.0)
+                if status in opened_statuses:
+                    bucket["opened_signals"] += 1
+                if status in blocked_statuses or status.startswith("BLOCKED"):
+                    bucket["blocked_signals"] += 1
+                if status == "SUCCEEDED":
+                    bucket["succeeded_signals"] += 1
+                if status == "FAILED":
+                    bucket["failed_signals"] += 1
+                if forecast_result == "watching":
+                    bucket["forecast_watching"] += 1
+                else:
+                    bucket["forecast_resolved"] += 1
+                if forecast_result in forecast_success_results:
+                    bucket["forecast_successes"] += 1
+                if forecast_result in forecast_failure_results:
+                    bucket["forecast_failures"] += 1
+                if forecast_result == "expired_no_hit":
+                    bucket["forecast_expired"] += 1
+                    bucket["expired_no_hit"] += 1
+                if forecast_result == "tp1_hit":
+                    bucket["tp1_hits"] += 1
+                if forecast_result == "tp2_hit":
+                    bucket["tp2_hits"] += 1
+                if forecast_result == "stop_hit":
+                    bucket["stop_hits"] += 1
+
+        def finalize(bucket: Dict[str, Any]) -> None:
+            trade_resolved = bucket["succeeded_signals"] + bucket["failed_signals"]
+            forecast_directional = bucket["forecast_successes"] + bucket["forecast_failures"]
+            bucket["success_rate"] = (bucket["succeeded_signals"] / trade_resolved) if trade_resolved else 0.0
+            bucket["open_rate"] = (bucket["opened_signals"] / bucket["total_signals"]) if bucket["total_signals"] else 0.0
+            bucket["forecast_success_rate"] = (bucket["forecast_successes"] / forecast_directional) if forecast_directional else 0.0
+            bucket["avg_quality_score"] = bucket["avg_quality_score"] / bucket["total_signals"] if bucket["total_signals"] else 0.0
 
         for mod in by_module.values():
-            mod_resolved = mod["succeeded_signals"] + mod["failed_signals"]
-            mod["success_rate"] = (mod["succeeded_signals"] / mod_resolved) if mod_resolved else 0.0
-            mod["open_rate"] = (mod["opened_signals"] / mod["total_signals"]) if mod["total_signals"] else 0.0
-            mod["avg_quality_score"] = mod["avg_quality_score"] / mod["total_signals"] if mod["total_signals"] else 0.0
+            finalize(mod)
+        for quality in by_quality.values():
+            finalize(quality)
 
         avg_quality = sum(float(s.get("quality_score") or 0.0) for s in signals) / total if total else 0.0
         return {
@@ -181,8 +235,19 @@ class ReportGenerator:
             "failed_signals": len(failed),
             "success_rate": (len(succeeded) / resolved) if resolved else 0.0,
             "open_rate": (len(opened) / total) if total else 0.0,
+            "forecast_watching": len(forecast_watching),
+            "forecast_resolved": forecast_resolved,
+            "forecast_successes": len(forecast_successes),
+            "forecast_failures": len(forecast_failures),
+            "forecast_expired": len(forecast_expired),
+            "forecast_success_rate": (len(forecast_successes) / directional_resolved) if directional_resolved else 0.0,
+            "tp1_hits": sum(1 for s in signals if s.get("forecast_result") == "tp1_hit"),
+            "tp2_hits": sum(1 for s in signals if s.get("forecast_result") == "tp2_hit"),
+            "stop_hits": len(forecast_failures),
+            "expired_no_hit": len(forecast_expired),
             "avg_quality_score": avg_quality,
             "by_module": dict(sorted(by_module.items())),
+            "by_quality": dict(sorted(by_quality.items())),
             "recent_signals": signals[-20:],
         }
     def _get_equity_history_for_period(
@@ -447,6 +512,10 @@ class ReportGenerator:
                 f"| Blocked/Skipped Signals | {signal_stats.get('blocked_signals', 0)} |",
                 f"| Succeeded / Failed | {signal_stats.get('succeeded_signals', 0)} / {signal_stats.get('failed_signals', 0)} |",
                 f"| Signal Success Rate | {signal_stats.get('success_rate', 0):.1%} |",
+                f"| Forecast Success Rate | {signal_stats.get('forecast_success_rate', 0):.1%} |",
+                f"| Forecast Resolved | {signal_stats.get('forecast_resolved', 0)} resolved / {signal_stats.get('forecast_watching', 0)} watching |",
+                f"| TP1 / TP2 Hits | {signal_stats.get('tp1_hits', 0)} / {signal_stats.get('tp2_hits', 0)} |",
+                f"| Stop / Expired | {signal_stats.get('stop_hits', 0)} / {signal_stats.get('expired_no_hit', 0)} |",
                 f"| Signal Open Rate | {signal_stats.get('open_rate', 0):.1%} |",
                 f"| Avg Quality Score | {signal_stats.get('avg_quality_score', 0):.1f} |",
                 "",
@@ -457,14 +526,16 @@ class ReportGenerator:
                 lines.extend([
                     "### Signal Breakdown by Module",
                     "",
-                    "| Strategy | Signals | Opened | Blocked | Success Rate | Avg Quality |",
-                    "|----------|---------|--------|---------|--------------|-------------|",
+                    "| Strategy | Signals | Opened | Blocked | Trade Success | Forecast Success | TP / Stop / Expired | Avg Quality |",
+                    "|----------|---------|--------|---------|---------------|------------------|---------------------|-------------|",
                 ])
                 for module, stats in by_module.items():
                     lines.append(
                         f"| {module} | {stats.get('total_signals', 0)} | "
                         f"{stats.get('opened_signals', 0)} | {stats.get('blocked_signals', 0)} | "
-                        f"{stats.get('success_rate', 0):.1%} | {stats.get('avg_quality_score', 0):.1f} |"
+                        f"{stats.get('success_rate', 0):.1%} | {stats.get('forecast_success_rate', 0):.1%} | "
+                        f"{stats.get('forecast_successes', 0)} / {stats.get('stop_hits', 0)} / {stats.get('expired_no_hit', 0)} | "
+                        f"{stats.get('avg_quality_score', 0):.1f} |"
                     )
                 lines.append("")
         if report.strategy_breakdown:

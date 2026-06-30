@@ -149,6 +149,149 @@ class TradingBot:
         )
 
 
+    @staticmethod
+    def _parse_iso_ms(value: str | None) -> int:
+        if not value:
+            return 0
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return int(parsed.timestamp() * 1000)
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _timeframe_ms(timeframe: str) -> int:
+        raw = (timeframe or "5m").strip().lower()
+        try:
+            amount = int(raw[:-1])
+        except ValueError:
+            return 5 * 60 * 1000
+        unit = raw[-1]
+        if unit == "m":
+            return amount * 60 * 1000
+        if unit == "h":
+            return amount * 60 * 60 * 1000
+        if unit == "d":
+            return amount * 24 * 60 * 60 * 1000
+        return 5 * 60 * 1000
+
+    def _forecast_expires_at(self, candle_open_time: int) -> str:
+        expiry_ms = candle_open_time + (self._timeframe_ms(self.cfg.timeframe) * max(1, self.cfg.signal_forecast_expiry_candles))
+        return datetime.fromtimestamp(expiry_ms / 1000, tz=UTC).isoformat()
+
+    @staticmethod
+    def _forecast_r_multiple(entry: float, stop: float, hit_price: float) -> float:
+        risk = abs(entry - stop)
+        if risk <= 0:
+            return 0.0
+        return round(abs(hit_price - entry) / risk, 4)
+
+    def _evaluate_signal_forecasts(self, snapshot: MarketSnapshot) -> None:
+        unresolved = self.state_store.get_unresolved_signal_forecasts(
+            symbol=snapshot.symbol,
+            market=snapshot.market.value,
+            profile_id=self.cfg.profile_id,
+        )
+        if not unresolved or not snapshot.candles:
+            return
+
+        now_ms = int(time.time() * 1000)
+        for signal in unresolved:
+            generated_ms = self._parse_iso_ms(signal.get("generated_at_utc"))
+            expiry_ms = self._parse_iso_ms(signal.get("forecast_expires_at_utc"))
+            if expiry_ms <= 0:
+                expiry_ms = generated_ms + (self._timeframe_ms(self.cfg.timeframe) * max(1, self.cfg.signal_forecast_expiry_candles))
+
+            entry = float(signal.get("entry") or 0.0)
+            stop = float(signal.get("stop") or 0.0)
+            target_1 = float(signal.get("target_1") or 0.0)
+            target_2 = float(signal.get("target_2") or 0.0)
+            direction = str(signal.get("direction") or "").upper()
+            candles = [c for c in snapshot.candles if c.open_time >= generated_ms and c.open_time <= expiry_ms]
+
+            for candle in candles:
+                hit_at = datetime.fromtimestamp(candle.open_time / 1000, tz=UTC).isoformat()
+                if direction == Direction.LONG.value:
+                    if candle.low <= stop:
+                        self.state_store.update_signal_forecast(
+                            signal.get("id"),
+                            "RESOLVED",
+                            "stop_hit",
+                            "Forecast invalidated: stop was touched before target",
+                            forecast_hit_at_utc=hit_at,
+                            forecast_hit_price=stop,
+                            forecast_r_multiple=-1.0,
+                        )
+                        break
+                    if target_2 > 0 and candle.high >= target_2:
+                        self.state_store.update_signal_forecast(
+                            signal.get("id"),
+                            "RESOLVED",
+                            "tp2_hit",
+                            "Forecast succeeded: TP2 was touched before stop",
+                            forecast_hit_at_utc=hit_at,
+                            forecast_hit_price=target_2,
+                            forecast_r_multiple=self._forecast_r_multiple(entry, stop, target_2),
+                        )
+                        break
+                    if target_1 > 0 and candle.high >= target_1:
+                        self.state_store.update_signal_forecast(
+                            signal.get("id"),
+                            "RESOLVED",
+                            "tp1_hit",
+                            "Forecast succeeded: TP1 was touched before stop",
+                            forecast_hit_at_utc=hit_at,
+                            forecast_hit_price=target_1,
+                            forecast_r_multiple=self._forecast_r_multiple(entry, stop, target_1),
+                        )
+                        break
+                elif direction == Direction.SHORT.value:
+                    if candle.high >= stop:
+                        self.state_store.update_signal_forecast(
+                            signal.get("id"),
+                            "RESOLVED",
+                            "stop_hit",
+                            "Forecast invalidated: stop was touched before target",
+                            forecast_hit_at_utc=hit_at,
+                            forecast_hit_price=stop,
+                            forecast_r_multiple=-1.0,
+                        )
+                        break
+                    if target_2 > 0 and candle.low <= target_2:
+                        self.state_store.update_signal_forecast(
+                            signal.get("id"),
+                            "RESOLVED",
+                            "tp2_hit",
+                            "Forecast succeeded: TP2 was touched before stop",
+                            forecast_hit_at_utc=hit_at,
+                            forecast_hit_price=target_2,
+                            forecast_r_multiple=self._forecast_r_multiple(entry, stop, target_2),
+                        )
+                        break
+                    if target_1 > 0 and candle.low <= target_1:
+                        self.state_store.update_signal_forecast(
+                            signal.get("id"),
+                            "RESOLVED",
+                            "tp1_hit",
+                            "Forecast succeeded: TP1 was touched before stop",
+                            forecast_hit_at_utc=hit_at,
+                            forecast_hit_price=target_1,
+                            forecast_r_multiple=self._forecast_r_multiple(entry, stop, target_1),
+                        )
+                        break
+            else:
+                if now_ms >= expiry_ms:
+                    self.state_store.update_signal_forecast(
+                        signal.get("id"),
+                        "RESOLVED",
+                        "expired_no_hit",
+                        "Forecast expired before price touched TP or stop",
+                        forecast_hit_at_utc=datetime.fromtimestamp(expiry_ms / 1000, tz=UTC).isoformat(),
+                        forecast_r_multiple=0.0,
+                    )
+
     def _quality_for_signal(self, sig: Signal, snapshot: MarketSnapshot, strategy_reason: str) -> tuple[float, str]:
         score = 45.0
         score += min(max(sig.risk_multiple, 0.0), 3.0) * 9.0
@@ -193,6 +336,8 @@ class TradingBot:
                 "quality_label": quality_label,
                 "status": "GENERATED",
                 "status_reason": "Strategy module produced a tradable setup",
+                "forecast_expires_at_utc": self._forecast_expires_at(candle_open_time),
+                "forecast_reason": f"Watching for TP/stop for {max(1, self.cfg.signal_forecast_expiry_candles)} candles",
                 "profile_id": self.cfg.profile_id,
             },
             profile_id=self.cfg.profile_id,
@@ -347,6 +492,7 @@ class TradingBot:
             snapshot = self.data.fetch_snapshot(sym, market, self.cfg.timeframe)
             if snapshot is None:
                 continue
+            self._evaluate_signal_forecasts(snapshot)
             closed = self.execution.mark_to_market(snapshot)
             for trade in closed:
                 is_partial = trade.partial_exit or trade.close_reason == "TAKE_PROFIT_1_PARTIAL"
@@ -373,6 +519,9 @@ class TradingBot:
                             "regime": trade.regime.value,
                             "close_reason": trade.close_reason,
                             "partial_exit": trade.partial_exit,
+                            "fee_paid": trade.fee_paid,
+                            "funding_paid": trade.funding_paid,
+                            "execution_model": "paper-slippage-fee-model",
                             "profile_id": self.cfg.profile_id,
                         }
                     )
@@ -428,6 +577,7 @@ class TradingBot:
                 )
             snap = self.data.fetch_snapshot(pending.signal.symbol, pending.signal.market, self.cfg.timeframe)
             if snap is not None:
+                self._evaluate_signal_forecasts(snap)
                 rules = self._get_rules(snap.symbol, snap.market)
                 pos = self.execution.check_pending_order(snap, rules)
                 if pos is not None:
@@ -464,6 +614,7 @@ class TradingBot:
 
             snapshots = [s for s in [spot_snapshot, perp_snapshot] if s is not None]
             for snap in snapshots:
+                self._evaluate_signal_forecasts(snap)
                 decision = self._evaluate_snapshot(snap)
                 if decision.signal is None:
                     continue

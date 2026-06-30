@@ -21,6 +21,10 @@ type Trade = {
   partial_exit?: boolean;
   regime?: string;
   r_multiple?: number;
+  fee_paid?: number;
+  funding_paid?: number;
+  simulated_friction?: number;
+  execution_model?: string;
   profile_id?: string;
 };
 
@@ -69,6 +73,14 @@ type SignalJournal = {
   pnl?: number | null;
   r_multiple?: number | null;
   close_reason?: string | null;
+  forecast_status?: string;
+  forecast_result?: string;
+  forecast_reason?: string;
+  forecast_expires_at_utc?: string | null;
+  forecast_hit_at_utc?: string | null;
+  forecast_hit_price?: number | null;
+  forecast_r_multiple?: number | null;
+  forecast_updated_at_utc?: string | null;
   profile_id?: string;
 };
 
@@ -79,12 +91,43 @@ type SignalStats = {
   succeeded_signals: number;
   failed_signals: number;
   open_signals?: number;
+  forecast_watching?: number;
+  forecast_resolved?: number;
+  forecast_successes?: number;
+  forecast_failures?: number;
+  forecast_expired?: number;
+  tp1_hits?: number;
+  tp2_hits?: number;
+  stop_hits?: number;
+  expired_no_hit?: number;
   success_rate: number;
   open_rate: number;
+  forecast_success_rate?: number;
+  forecast_resolution_rate?: number;
+  tp_hit_rate?: number;
+  stop_hit_rate?: number;
+  expired_rate?: number;
   avg_quality_score?: number;
   by_module?: Record<string, SignalStats>;
+  by_quality?: Record<string, SignalStats>;
 };
 
+type SimulationStats = {
+  execution_model: string;
+  total_closed_trades: number;
+  total_fees: number;
+  total_funding: number;
+  total_friction: number;
+  gross_estimated_pnl: number;
+  net_pnl: number;
+  friction_drag_pct: number;
+  avg_fee_per_trade: number;
+  partial_exits: number;
+  blocked_execution: number;
+  blocked_risk: number;
+  pending_orders: number;
+  expired_orders: number;
+};
 type SignalsResponse = {
   signals: SignalJournal[];
   stats: SignalStats;
@@ -106,6 +149,7 @@ type BotState = {
   trading_stats: TradingStats;
   recent_signals: SignalJournal[];
   signal_stats: SignalStats;
+  simulation_stats: SimulationStats;
 };
 
 type HealthResponse = {
@@ -148,7 +192,7 @@ type RouteStatus = {
 
 type Theme = "dark" | "light";
 type TradeFilter = "all" | "wins" | "losses";
-type DashboardView = "overview" | "markets" | "strategies" | "signals" | "trades" | "system" | "reports";
+type DashboardView = "overview" | "markets" | "strategies" | "signals" | "readiness" | "trades" | "system" | "reports";
 type ReportPeriod = "daily" | "weekly" | "monthly";
 
 type LiveTicker = {
@@ -211,6 +255,22 @@ const EMPTY_STATE: BotState = {
     avg_r_multiple: 0,
   },
   recent_signals: [],
+  simulation_stats: {
+    execution_model: "paper-slippage-fee-model",
+    total_closed_trades: 0,
+    total_fees: 0,
+    total_funding: 0,
+    total_friction: 0,
+    gross_estimated_pnl: 0,
+    net_pnl: 0,
+    friction_drag_pct: 0,
+    avg_fee_per_trade: 0,
+    partial_exits: 0,
+    blocked_execution: 0,
+    blocked_risk: 0,
+    pending_orders: 0,
+    expired_orders: 0,
+  },
   signal_stats: {
     total_signals: 0,
     opened_signals: 0,
@@ -218,10 +278,25 @@ const EMPTY_STATE: BotState = {
     succeeded_signals: 0,
     failed_signals: 0,
     open_signals: 0,
+    forecast_watching: 0,
+    forecast_resolved: 0,
+    forecast_successes: 0,
+    forecast_failures: 0,
+    forecast_expired: 0,
+    tp1_hits: 0,
+    tp2_hits: 0,
+    stop_hits: 0,
+    expired_no_hit: 0,
     success_rate: 0,
     open_rate: 0,
+    forecast_success_rate: 0,
+    forecast_resolution_rate: 0,
+    tp_hit_rate: 0,
+    stop_hit_rate: 0,
+    expired_rate: 0,
     avg_quality_score: 0,
     by_module: {},
+    by_quality: {},
   },
 };
 
@@ -340,6 +415,7 @@ function mergeState(current: BotState | null, patch: Partial<BotState>): BotStat
     trading_stats: patch.trading_stats ?? base.trading_stats,
     recent_signals: patch.recent_signals ?? base.recent_signals,
     signal_stats: patch.signal_stats ?? base.signal_stats,
+    simulation_stats: patch.simulation_stats ?? base.simulation_stats,
   };
 }
 
@@ -368,6 +444,26 @@ function formatSignalResult(signal: SignalJournal): string {
     return signal.close_reason || "-";
   }
   return `${formatSignedCurrency(signal.pnl)}${signal.r_multiple !== null && signal.r_multiple !== undefined ? ` / ${signal.r_multiple.toFixed(2)}R` : ""}`;
+}
+
+function formatForecastResult(signal: SignalJournal): string {
+  const result = signal.forecast_result || "watching";
+  if (result === "watching") {
+    return signal.forecast_expires_at_utc ? `watching until ${formatCompactDate(signal.forecast_expires_at_utc)}` : "watching";
+  }
+  if (result === "tp1_hit") {
+    return `TP1 hit${signal.forecast_r_multiple !== null && signal.forecast_r_multiple !== undefined ? ` / ${signal.forecast_r_multiple.toFixed(2)}R` : ""}`;
+  }
+  if (result === "tp2_hit") {
+    return `TP2 hit${signal.forecast_r_multiple !== null && signal.forecast_r_multiple !== undefined ? ` / ${signal.forecast_r_multiple.toFixed(2)}R` : ""}`;
+  }
+  if (result === "stop_hit") {
+    return "stop hit / -1.00R";
+  }
+  if (result === "expired_no_hit") {
+    return "expired no hit";
+  }
+  return result.replace(/_/g, " ");
 }
 function buildLinePath(values: number[], height = 42): string {
   const cleanValues = values.filter((value) => Number.isFinite(value));
@@ -755,6 +851,44 @@ export function TradingDashboard({
     activeState.open_position ? latestTrade?.strategy_module : latestTrade?.strategy_module || activeModuleEntry?.[0],
   );
   const appliedStrategySource = latestTrade ? "Latest trade" : activeModuleEntry ? "Scorecard" : "Configured";
+  const simulationStats = activeState.simulation_stats ?? EMPTY_STATE.simulation_stats;
+  const routeFailureCount = routeStatuses.filter((route) => !route.ok).length;
+  const marketRouteFailures = routeStatuses.filter((route) => route.name.startsWith("market:") && !route.ok).length;
+  const evidenceTimes = [
+    ...activeState.recent_signals.map((signal) => new Date(signal.generated_at_utc).getTime()),
+    ...activeState.recent_trades.map((trade) => new Date(trade.timestamp).getTime()),
+  ].filter(Number.isFinite);
+  const evidenceDays = evidenceTimes.length > 1 ? Math.max(0, (Date.now() - Math.min(...evidenceTimes)) / 86400000) : 0;
+  const forecastDirectionalCount = (signalStats.forecast_successes ?? 0) + (signalStats.forecast_failures ?? 0);
+  const equityValues = (activeState.equity_history ?? []).map((point) => point.equity).filter(Number.isFinite);
+  let peakEquity = equityValues[0] ?? activeState.starting_equity;
+  const maxDrawdownPct = equityValues.reduce((maxDrawdown, equity) => {
+    peakEquity = Math.max(peakEquity || equity, equity);
+    if (!peakEquity) {
+      return maxDrawdown;
+    }
+    return Math.max(maxDrawdown, (peakEquity - equity) / peakEquity);
+  }, 0);
+  const readinessGates = [
+    { label: "Evidence Window", passed: evidenceDays >= 30, detail: `${evidenceDays.toFixed(1)} / 30 days` },
+    { label: "Signal Sample", passed: signalStats.total_signals >= 100, detail: `${signalStats.total_signals} / 100 signals` },
+    {
+      label: "Forecast Edge",
+      passed: forecastDirectionalCount >= 30 && (signalStats.forecast_success_rate ?? 0) >= 0.5,
+      detail: forecastDirectionalCount > 0 ? `${formatPercent(signalStats.forecast_success_rate ?? 0)} across ${forecastDirectionalCount}` : "waiting for resolved forecasts",
+    },
+    { label: "Paper P&L", passed: simulationStats.net_pnl > 0 || equityChange > 0, detail: formatSignedCurrency(simulationStats.net_pnl || equityChange) },
+    { label: "Drawdown Control", passed: maxDrawdownPct <= 0.1, detail: `${formatPercent(maxDrawdownPct)} max drawdown` },
+    { label: "Data Health", passed: routeStatuses.length > 0 && routeFailureCount === 0 && !isFallback, detail: routeStatuses.length ? `${routeOkCount}/${routeStatuses.length} routes OK` : "checking routes" },
+    { label: "Realism Costs", passed: simulationStats.total_closed_trades === 0 || simulationStats.total_friction > 0, detail: simulationStats.total_closed_trades > 0 ? `${formatCurrency(simulationStats.total_friction)} modeled friction` : "waiting for closed trades" },
+  ];
+  const readinessPassed = readinessGates.filter((gate) => gate.passed).length;
+  const exportLinks = [
+    { label: "Signals JSON", href: apiBase ? `${apiBase}/api/signals` : buildApiUrl("/api/bot/signals") },
+    { label: "Trades JSON", href: apiBase ? `${apiBase}/api/trades` : buildApiUrl("/api/bot/trades") },
+    { label: "State JSON", href: apiBase ? `${apiBase}/api/state` : buildApiUrl("/api/bot/state") },
+    { label: "Health JSON", href: apiBase ? `${apiBase}/api/health` : buildApiUrl("/api/bot/health") },
+  ];
 
   const moduleEntries = useMemo(
     () =>
@@ -1285,16 +1419,16 @@ export function TradingDashboard({
                 foot={`${signalStats.opened_signals} opened / ${signalStats.blocked_signals} blocked`}
               />
               <ReportMetricCard
-                label="Success Rate"
-                value={signalStats.succeeded_signals + signalStats.failed_signals > 0 ? formatPercent(signalStats.success_rate) : "N/A"}
-                tone={signalStats.success_rate >= 0.5 ? "positive" : "neutral"}
-                foot={`${signalStats.succeeded_signals} succeeded / ${signalStats.failed_signals} failed`}
+                label="Forecast Rate"
+                value={(signalStats.forecast_successes ?? 0) + (signalStats.forecast_failures ?? 0) > 0 ? formatPercent(signalStats.forecast_success_rate ?? 0) : "N/A"}
+                tone={(signalStats.forecast_success_rate ?? 0) >= 0.5 ? "positive" : "neutral"}
+                foot={`${signalStats.forecast_successes ?? 0} TP hits / ${signalStats.forecast_failures ?? 0} stop hits`}
               />
               <ReportMetricCard
-                label="Open Rate"
-                value={signalStats.total_signals > 0 ? formatPercent(signalStats.open_rate) : "N/A"}
-                tone="neutral"
-                foot={`${signalStats.open_signals ?? 0} currently open or pending`}
+                label="TP / Stop"
+                value={`${signalStats.tp1_hits ?? 0} / ${signalStats.stop_hits ?? 0}`}
+                tone={(signalStats.tp1_hits ?? 0) + (signalStats.tp2_hits ?? 0) >= (signalStats.stop_hits ?? 0) ? "positive" : "negative"}
+                foot={`TP2 ${signalStats.tp2_hits ?? 0} / expired ${signalStats.expired_no_hit ?? 0}`}
               />
               <ReportMetricCard
                 label="Filtered Result"
@@ -1373,7 +1507,8 @@ export function TradingDashboard({
                         <th>Quality</th>
                         <th>Strategy</th>
                         <th>Status</th>
-                        <th>Result</th>
+                        <th>Forecast</th>
+                        <th>Trade Result</th>
                         <th>Reason</th>
                       </tr>
                     </thead>
@@ -1392,8 +1527,9 @@ export function TradingDashboard({
                           <td>{signal.quality_label} / {signal.quality_score.toFixed(1)}</td>
                           <td>{normalizeStrategyCode(signal.strategy_module)}</td>
                           <td><span className={`signal-status-pill ${signalTone(signal.status)}`}>{signal.status}</span></td>
+                          <td>{formatForecastResult(signal)}</td>
                           <td>{formatSignalResult(signal)}</td>
-                          <td className="signal-reason-cell">{signal.status_reason || signal.strategy_reason || signal.rationale}</td>
+                          <td className="signal-reason-cell">{signal.forecast_reason || signal.status_reason || signal.strategy_reason || signal.rationale}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1729,10 +1865,10 @@ export function TradingDashboard({
                         <th>Signals</th>
                         <th>Opened</th>
                         <th>Blocked</th>
-                        <th>Succeeded</th>
-                        <th>Failed</th>
-                        <th>Success Rate</th>
-                        <th>Open Rate</th>
+                        <th>TP Hits</th>
+                        <th>Stops</th>
+                        <th>Forecast Rate</th>
+                        <th>Expired</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1742,10 +1878,10 @@ export function TradingDashboard({
                           <td>{stats.total_signals}</td>
                           <td>{stats.opened_signals}</td>
                           <td>{stats.blocked_signals}</td>
-                          <td>{stats.succeeded_signals}</td>
-                          <td>{stats.failed_signals}</td>
-                          <td>{stats.succeeded_signals + stats.failed_signals > 0 ? formatPercent(stats.success_rate) : "N/A"}</td>
-                          <td>{stats.total_signals > 0 ? formatPercent(stats.open_rate) : "N/A"}</td>
+                          <td>{(stats.tp1_hits ?? 0) + (stats.tp2_hits ?? 0)}</td>
+                          <td>{stats.stop_hits ?? 0}</td>
+                          <td>{(stats.forecast_successes ?? 0) + (stats.forecast_failures ?? 0) > 0 ? formatPercent(stats.forecast_success_rate ?? 0) : "N/A"}</td>
+                          <td>{stats.expired_no_hit ?? 0}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1925,6 +2061,135 @@ export function TradingDashboard({
                     <p className="empty-state">No trades in this {reportPeriod} period.</p>
                   );
                 })()}
+              </div>
+            </article>
+          </section>
+        ) : null}
+
+        {activeView === "readiness" ? (
+          <section className="readiness-page-grid">
+            <section className="runtime-strip" aria-label="Readiness summary">
+              <div>
+                <span>Readiness Gates</span>
+                <strong>{readinessPassed}/{readinessGates.length} passed</strong>
+              </div>
+              <div>
+                <span>Evidence Window</span>
+                <strong>{evidenceDays.toFixed(1)} days</strong>
+              </div>
+              <div>
+                <span>Signals</span>
+                <strong>{signalStats.total_signals}</strong>
+              </div>
+              <div>
+                <span>Forecast Rate</span>
+                <strong>{forecastDirectionalCount > 0 ? formatPercent(signalStats.forecast_success_rate ?? 0) : "N/A"}</strong>
+              </div>
+              <div>
+                <span>Max Drawdown</span>
+                <strong>{formatPercent(maxDrawdownPct)}</strong>
+              </div>
+            </section>
+
+            <article className="panel readiness-panel">
+              <div className="panel-header">
+                <div>
+                  <p className="panel-kicker">Live Readiness</p>
+                  <h2>Test Gates</h2>
+                </div>
+                <span>{readinessPassed === readinessGates.length ? "ready" : "not ready"}</span>
+              </div>
+              <div className="route-list readiness-list">
+                {readinessGates.map((gate) => (
+                  <div key={gate.label} className="route-row">
+                    <span className={gate.passed ? "route-dot ok" : "route-dot fail"} />
+                    <strong>{gate.label}</strong>
+                    <span>{gate.passed ? "pass" : "wait"}</span>
+                    <em>{gate.detail}</em>
+                  </div>
+                ))}
+              </div>
+            </article>
+
+            <article className="panel simulation-panel">
+              <div className="panel-header">
+                <div>
+                  <p className="panel-kicker">Paper Realism</p>
+                  <h2>Simulation Costs</h2>
+                </div>
+                <span>{simulationStats.execution_model}</span>
+              </div>
+              <div className="signal-details-wrap">
+                <table className="signal-details-table">
+                  <tbody>
+                    <tr><td><strong>Closed Trades</strong></td><td>{simulationStats.total_closed_trades}</td></tr>
+                    <tr><td><strong>Fees Paid</strong></td><td>{formatCurrency(simulationStats.total_fees)}</td></tr>
+                    <tr><td><strong>Funding Paid</strong></td><td>{formatSignedCurrency(simulationStats.total_funding)}</td></tr>
+                    <tr><td><strong>Total Friction</strong></td><td>{formatCurrency(simulationStats.total_friction)}</td></tr>
+                    <tr><td><strong>Gross Estimated P&L</strong></td><td>{formatSignedCurrency(simulationStats.gross_estimated_pnl)}</td></tr>
+                    <tr><td><strong>Net Paper P&L</strong></td><td>{formatSignedCurrency(simulationStats.net_pnl)}</td></tr>
+                    <tr><td><strong>Friction Drag</strong></td><td>{formatPercent(simulationStats.friction_drag_pct)}</td></tr>
+                    <tr><td><strong>Rejected by Execution</strong></td><td>{simulationStats.blocked_execution}</td></tr>
+                    <tr><td><strong>Blocked by Risk</strong></td><td>{simulationStats.blocked_risk}</td></tr>
+                    <tr><td><strong>Pending / Expired Orders</strong></td><td>{simulationStats.pending_orders} / {simulationStats.expired_orders}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article className="panel health-detail-panel">
+              <div className="panel-header">
+                <div>
+                  <p className="panel-kicker">Operational Health</p>
+                  <h2>Data Quality</h2>
+                </div>
+                <span>{routeStatuses.length ? `${routeOkCount}/${routeStatuses.length}` : "checking"}</span>
+              </div>
+              <div className="guardrail-list">
+                <div>
+                  <span>Route Failures</span>
+                  <strong>{routeFailureCount}</strong>
+                </div>
+                <div>
+                  <span>Market Failures</span>
+                  <strong>{marketRouteFailures}</strong>
+                </div>
+                <div>
+                  <span>WebSocket</span>
+                  <strong>{priceStreamConnected ? "Streaming" : "Unavailable"}</strong>
+                </div>
+                <div>
+                  <span>Backend</span>
+                  <strong>{health?.ok ? "Online" : isFallback ? "Fallback" : "Checking"}</strong>
+                </div>
+                <div>
+                  <span>Last Refresh</span>
+                  <strong>{formatCompactDate(lastRefresh)}</strong>
+                </div>
+                <div>
+                  <span>Data Source</span>
+                  <strong>{activeState.data_source || lastSource}</strong>
+                </div>
+              </div>
+            </article>
+
+            <article className="panel export-panel">
+              <div className="panel-header">
+                <div>
+                  <p className="panel-kicker">Evidence</p>
+                  <h2>Export Data</h2>
+                </div>
+                <span>JSON</span>
+              </div>
+              <div className="route-list export-list">
+                {exportLinks.map((link) => (
+                  <a key={link.label} className="route-row export-row" href={link.href} target="_blank" rel="noreferrer">
+                    <span className="route-dot ok" />
+                    <strong>{link.label}</strong>
+                    <span>open</span>
+                    <em>{link.href}</em>
+                  </a>
+                ))}
               </div>
             </article>
           </section>
